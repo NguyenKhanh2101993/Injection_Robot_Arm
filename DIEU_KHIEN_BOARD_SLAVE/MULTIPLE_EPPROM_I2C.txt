@@ -1,0 +1,295 @@
+#include "ModbusSlave.h"
+#include "EEPROM_25LC256.h"
+#include "EEPROM_24C256.h"
+#include "MyMCP23017.h"
+#include "Keypad5x7.h"
+
+#define ARDUINO_ADDRESS       2    // Dia chi board arduino slaver can dieu khien
+#define MCP23017_I2C_ADDRESS        0x40 // MCP23017_I2C_ADDRESS 0x20 + 0 = 0x40
+// 1 0 1 0  0 A1 A0 R/W
+#define ADDR_EEPROM_24C256_01       0xA0      // 1 0 1 0  0 0 0 R/W
+#define ADDR_EEPROM_24C256_02       0xA2      // 1 0 1 0  0 0 1 R/W
+#define SELECT_EEPROM_25LC256_01    53
+#define SELECT_EEPROM_25LC256_02    54
+// define COMMAND MODE
+#define MANUAL_MODE    BUTTON_06 
+#define REMOTR_MODE    BUTTON_13
+#define MODIFY_MODE    BUTTON_20
+#define TEACH_MODE     BUTTON_27
+#define MONITOR_MODE   BUTTON_34
+#define AUTO_MODE_01   BUTTON_07
+#define AUTO_MODE_02   BUTTON_14
+#define HOME           BUTTON_21
+#define STOP_01        BUTTON_28
+#define STOP_02        BUTTON_35
+
+// define operation mode
+#define MAIN_ARM_MODE   BUTTON_03
+#define PICK_ARM_MODE   BUTTON_10
+#define TWO_ARM_MODE    BUTTON_17
+// define actual
+#define ARM_DOWN        BUTTON_01
+#define ARM_UP          BUTTON_02
+#define ARM_FORWARD     BUTTON_08
+#define ARM_REVERS      BUTTON_09
+#define ARM_ROTATE_UP   BUTTON_16
+#define ARM_ROTATE_DOWN BUTTON_15
+#define ARM_GO_LEFT     BUTTON_23
+#define ARM_GO_RIGHT    BUTTON_22
+#define ARM_PICK        BUTTON_29
+#define ARM_UNPICK      BUTTON_30
+#define ARM_VACUUM      BUTTON_31
+// define operation
+#define OPERATION_01      BUTTON_04   // Trang Lưu trữ chương trình đã cài đặt: Lưu tối đa 8 chương trình
+#define OPERATION_02      BUTTON_05   // Trang Lưu trữ chương trình đã cài đặt: Lưu tối đa 8 chương trình
+
+//===========================================================
+// define mã nhận diện các step trong chương trình
+#define STEP 0xC0
+// define mã nhận diện truc X, Y, Z
+#define X_AXIS 0xA0
+#define Y_AXIS 0xA1
+#define Z_AXIS 0xA2
+#define A_AXIS 0xA3
+// define mã nhận diện các chức năng
+#define DELAY_STEP  0xB0
+#define OUTPUT_STEP 0xB1
+#define INPUT_STEP  0xB2
+#define REPEAT_STEP 0xB3 
+//===========================================================
+// define địa chỉ lưu tên 18 chương trình, mỗi chương trình chiếm 1820 ô nhớ 8 bit
+#define Program_Addr_00 0x0000 
+#define Program_Addr_01 0x071C
+#define Program_Addr_02 0x0E38
+#define Program_Addr_03 0x1554
+#define Program_Addr_04 0x1C70
+#define Program_Addr_05 0x238C
+#define Program_Addr_06 0x2AA8
+#define Program_Addr_07 0x31C4
+#define Program_Addr_08 0x38E0
+
+#define Program_Addr_09 0x3FFC
+#define Program_Addr_10 0x4718
+#define Program_Addr_11 0x4E34
+#define Program_Addr_12 0x5550
+#define Program_Addr_13 0x5C6C
+#define Program_Addr_14 0x6388
+#define Program_Addr_15 0x6AA4
+#define Program_Addr_16 0x71C0
+#define Program_Addr_17 0x78DC
+//===========================================================
+#define UInt16_word(arr, index) word(arr[index], arr[index + 1])  // Cộng 2 byte thành 1 word
+//#define for(int i = 0; i < 19; i++)  {Program_Addr[i] = 0x0000 + 1820*i;}
+uint16_t Program_Addr[] = {Program_Addr_00, Program_Addr_01, Program_Addr_02, Program_Addr_03, Program_Addr_04,
+                           Program_Addr_05, Program_Addr_06, Program_Addr_07, Program_Addr_08, Program_Addr_09, 
+                           Program_Addr_10, Program_Addr_11, Program_Addr_12, Program_Addr_13, Program_Addr_14,
+                           Program_Addr_15, Program_Addr_16, Program_Addr_17 };
+uint16_t Program_start_addr; // Địa chỉ bắt đầu chạy khi nhấn nút Auto
+
+uint8_t COMMAND = 0xFF;
+
+Modbus                  NODE_SLAVE(Serial2, ARDUINO_ADDRESS);
+EEPROM_25LC256          EEPROM256_01;
+EEPROM_25LC256          EEPROM256_02;
+EEPROM_24C256   EEPROM24C256_01;
+EEPROM_24C256   EEPROM24C256_02;
+/***************************************
+//================================================================
+// Đọc data từ EEPROM256 khi gặp mã nhận diện STEP, trả về giá trị số thứ tự step trong chương trình
+uint16_t Read_Program_STEP (EEPROM_25LC256 &EEPROM256, uint16_t Address){
+  uint8_t data_index_step[3];
+  uint8_t result = 1;
+  result = EEPROM256.Read_Mutiple_data_from_EEPROM (Address, 3);
+  if (result == 0){ 
+    for (int i = 0; i < 3; i++) { 
+      data_index_step[i] = EEPROM256.getResponseBuffer(i); 
+    } 
+  }
+  if (data_index_step[0] == STEP) { return UInt16_word(data_index_step, 1); }
+  else return 0xFFFF;
+  }
+//================================================================
+// Đọc data từ EEPROM256 khi gặp mã nhận diện DELAY_STEP: FF FFFF
+uint16_t Read_Program_DELAY (EEPROM_25LC256 &EEPROM256, uint16_t Address){
+  uint8_t data_index_delay[3];
+  uint8_t result = 1;
+  result = EEPROM256.Read_Mutiple_data_from_EEPROM (Address, 3);
+  if (result == 0){ 
+    for (int i = 0; i < 3; i++) { 
+      data_index_delay[i] = EEPROM256.getResponseBuffer(i); 
+    } 
+  }
+  if (data_index_delay[0] == DELAY_STEP) { return UInt16_word(data_index_delay, 1); }
+  else return 0xFFFF;
+  }
+//================================================================
+// Đọc data từ EEPROM256 khi gặp mã nhận diện REPEAT_STEP: FF FFFF
+uint16_t Read_Program_REPEAT (EEPROM_25LC256 &EEPROM256, uint16_t Address){
+  uint8_t data_index_repeat[3];
+  uint8_t result = 1;
+  result = EEPROM256.Read_Mutiple_data_from_EEPROM (Address, 3);
+  if (result == 0){ 
+    for (int i = 0; i < 3; i++) { 
+      data_index_repeat[i] = EEPROM256.getResponseBuffer(i); 
+    } 
+  }
+  if (data_index_repeat[0] == REPEAT_STEP) { return UInt16_word(data_index_repeat, 1); }
+  else return 0xFFFF;
+  }
+//================================================================
+// Đọc data từ EEPROM256 khi gặp mã nhận diện X_AXIS: FF FFFF FFFF
+int32_t Read_Program_X_axis (EEPROM_25LC256 &EEPROM256, uint16_t Address){
+  uint32_t data_index_X_axis[5];
+  uint8_t result = 1;
+  result = EEPROM256.Read_Mutiple_data_from_EEPROM (Address, 5);
+  if (result == 0){ 
+    for (int i = 0; i < 5; i++) { 
+      data_index_X_axis[i] = EEPROM256.getResponseBuffer(i); 
+    } 
+  }
+  if (data_index_X_axis[0] == X_AXIS) { return ((data_index_X_axis[1] << 24) | (data_index_X_axis[2] << 16) | (data_index_X_axis[3] << 8) | (data_index_X_axis[4])); }
+  else return -1;
+  }
+//================================================================
+// Đọc data từ EEPROM256 khi gặp mã nhận diện Y_AXIS: FF FFFF FFFF
+int32_t Read_Program_Y_axis (EEPROM_25LC256 &EEPROM256, uint16_t Address){
+  uint32_t data_index_Y_axis[5];
+  uint8_t result = 1;
+  result = EEPROM256.Read_Mutiple_data_from_EEPROM (Address, 5);
+  if (result == 0){ 
+    for (int i = 0; i < 5; i++) { 
+      data_index_Y_axis[i] = EEPROM256.getResponseBuffer(i); 
+    } 
+  }
+  if (data_index_Y_axis[0] == Y_AXIS) { return ((data_index_Y_axis[1] << 24) | (data_index_Y_axis[2] << 16) | (data_index_Y_axis[3] << 8) | (data_index_Y_axis[4])); }
+  else return -1;
+  }
+//================================================================
+// Đọc data từ EEPROM256 khi gặp mã nhận diện Z_AXIS: FF FFFF FFFF
+int32_t Read_Program_Z_axis (EEPROM_25LC256 &EEPROM256, uint16_t Address){
+  uint32_t data_index_Z_axis[5];
+  uint8_t result = 1;
+  result = EEPROM256.Read_Mutiple_data_from_EEPROM (Address, 5);
+  if (result == 0){ 
+    for (int i = 0; i < 5; i++) { 
+      data_index_Z_axis[i] = EEPROM256.getResponseBuffer(i); 
+    } 
+  }
+  if (data_index_Z_axis[0] == Z_AXIS) { return ((data_index_Z_axis[1] << 24) | (data_index_Z_axis[2] << 16) | (data_index_Z_axis[3] << 8) | (data_index_Z_axis[4])); }
+  else return -1;
+  }
+//================================================================
+// Đọc data từ EEPROM256 khi gặp mã nhận diện A_AXIS: FF FFFF FFFF
+int32_t Read_Program_A_axis (EEPROM_25LC256 &EEPROM256, uint16_t Address){
+  uint32_t data_index_A_axis[5];
+  uint8_t result = 1;
+  result = EEPROM256.Read_Mutiple_data_from_EEPROM (Address, 5);
+  if (result == 0){ 
+    for (int i = 0; i < 5; i++) { 
+      data_index_A_axis[i] = EEPROM256.getResponseBuffer(i); 
+    } 
+  }
+  if (data_index_A_axis[0] == A_AXIS) { return ((data_index_A_axis[1] << 24) | (data_index_A_axis[2] << 16) | (data_index_A_axis[3] << 8) | (data_index_A_axis[4])); }
+  else return -1;
+  }
+//================================================================
+// Đọc data từ EEPROM256 khi gặp mã nhận diện OUTPUT_STEP: FF FFFF FFFF FFFF FFFF out 64 ngõ ra output
+// Trả về mảng 9 byte giá trị
+uint8_t* Read_Program_OUTPUT (EEPROM_25LC256 &EEPROM256, uint16_t Address){ 
+  static uint8_t data_index_output[9];
+  uint8_t result = 1;
+  result = EEPROM256.Read_Mutiple_data_from_EEPROM (Address, 9);
+  if (result == 0){ 
+    for (int i = 0; i < 9; i++) { 
+      data_index_output[i] = EEPROM256.getResponseBuffer(i); 
+    } 
+  }
+  if (data_index_output[0] == OUTPUT_STEP) { return data_index_output; }
+  else return NULL;
+  }
+//================================================================
+// Đọc data từ EEPROM256 khi gặp mã nhận diện INPUT_STEP: FF FFFF FFFF FFFF FFFF đọc 64 ngõ vào input
+// Trả về mảng 9 byte giá trị
+uint8_t* Read_Program_INPUT (EEPROM_25LC256 &EEPROM256, uint16_t Address){
+  static uint8_t data_index_input[9];
+  uint8_t result = 1;
+  result = EEPROM256.Read_Mutiple_data_from_EEPROM (Address, 9);
+  if (result == 0){ 
+    for (int i = 0; i < 9; i++) { 
+      data_index_input[i] = EEPROM256.getResponseBuffer(i); 
+    } 
+  }
+  if (data_index_input[0] == INPUT_STEP) { return data_index_input; }
+  else return NULL;
+  }
+**********************/
+//================================================================
+// Đọc data từ EEPROM256 khi gặp mã nhận diện INPUT_STEP: FF FFFF FFFF FFFF FFFF đọc 64 ngõ vào input
+// Trả về mảng 9 byte giá trị
+uint8_t* Read_Program_INPUT (EEPROM_24C256 &EEPROM256, uint16_t Address){
+  static uint8_t data_index_input[9];
+  uint8_t result = 1;
+  result = EEPROM256.Read_Mutiple_data_from_EEPROM (Address, 9);
+  if (result == 0){ 
+    for (int i = 0; i < 9; i++) { 
+      data_index_input[i] = EEPROM256.getResponseBuffer(i); 
+    } 
+  }
+  if (data_index_input[0] == INPUT_STEP) { return data_index_input; }
+  else return NULL;
+  }
+//================================================================
+// Đọc data từ EEPROM256 khi gặp mã nhận diện DELAY_STEP: FF FFFF
+uint16_t Read_Program_DELAY (EEPROM_24C256 &EEPROM256, uint16_t Address){
+  uint8_t data_index_delay[2];
+  uint8_t result = 1;
+  result = EEPROM256.Read_Mutiple_data_from_EEPROM (Address, 2);
+  if (result == 0){ 
+    for (int i = 0; i < 4; i++) { 
+      data_index_delay[i] = EEPROM256.getResponseBuffer(i); 
+      //Serial.print("Gia tri read: "); Serial.println(data_index_delay[i], HEX);
+    } 
+  }
+  //if (data_index_delay[0] == DELAY_STEP) { 
+    return (UInt16_word(data_index_delay, 0)); 
+    //}
+  //else return 0xFFFF;
+  }
+//================================================================
+void Write_to_EEPROM(EEPROM_24C256 &EEPROM256, uint16_t Address, uint16_t data){
+  uint8_t trans_data[2];
+  uint8_t result;
+  trans_data[0] = highByte(data); //Serial.print("highByte: "); Serial.print(trans_data[0],HEX);
+  trans_data[1] = lowByte(data); //Serial.print("lowByte: "); Serial.print(trans_data[1],HEX);
+  result = EEPROM256.Write_Mutiple_data_to_EEPROM(trans_data, 0x0000, 2);
+}
+//============================================================================================
+//============================================================================================
+void setup() {  
+  Serial.begin(9600);
+  Serial2.begin(115200);
+  NODE_SLAVE.begin(115200);
+  //EEPROM256_01.begin(SELECT_EEPROM_25LC256_01);
+  //EEPROM256_02.begin(SELECT_EEPROM_25LC256_02);
+  EEPROM24C256_01.begin(ADDR_EEPROM_24C256_01);
+  EEPROM24C256_02.begin(ADDR_EEPROM_24C256_02);
+
+  Write_to_EEPROM(EEPROM24C256_01, 0x0000, 0x0F8F);
+  Write_to_EEPROM(EEPROM24C256_02, 0x0000, 0xF677);
+}
+  uint16_t DELAY_Value;
+//============================================================================================
+//============================================================================================
+void loop() {
+  DELAY_Value = 0;
+
+  Serial.print("Delay value EEPROM24C256_01: ");
+  DELAY_Value = Read_Program_DELAY(EEPROM24C256_01, 0x0000); 
+  Serial.println(DELAY_Value, HEX);
+
+  delay(1000);
+
+  Serial.print("Delay value EEPROM24C256_02: ");
+  DELAY_Value = Read_Program_DELAY(EEPROM24C256_02, 0x0000); 
+  Serial.println(DELAY_Value, HEX);
+}
